@@ -83,6 +83,7 @@ type Options struct {
 }
 
 func NewOptions() *Options {
+	//创建默认的Options结构，作为nsqd启动的参数来源
 	hostname, err := os.Hostname()
 	if err != nil {
 		log.Fatal(err)

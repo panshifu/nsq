@@ -184,6 +184,7 @@ type program struct {
 
 func main() {
 	prg := &program{}
+	// SIGINT(任意键),SIGTERM(kill)
 	if err := svc.Run(prg, syscall.SIGINT, syscall.SIGTERM); err != nil {
 		log.Fatal(err)
 	}
@@ -198,7 +199,8 @@ func (p *program) Init(env svc.Environment) error {
 }
 
 func (p *program) Start() error {
-	opts := nsqd.NewOptions()
+	//项目主入口
+	opts := nsqd.NewOptions() //生成nsqd启动参数
 
 	flagSet := nsqdFlagSet(opts)
 	flagSet.Parse(os.Args[1:])
@@ -219,14 +221,21 @@ func (p *program) Start() error {
 		}
 	}
 	cfg.Validate()
-
+	// 通过flag包实现了命令行参数接收，如果命令行中执行配置文件，会同时读取配置文件。
+	// 根据配置文件，命令行参数，来创建一个nsqd结构
 	options.Resolve(opts, flagSet, cfg)
 	nsqd := nsqd.New(opts)
 
+	//LoadMetadata()过程；1：先使用atomic库加锁，2：读取node id的文件，以及默认文件，比对二者，并从文件中获取数据
+	//3:将数据json解析出meta结构，4：遍历meta，获取topic name以及channel name，对需要暂停的topic/channel进行暂停操作
 	err := nsqd.LoadMetadata()
 	if err != nil {
 		log.Fatalf("ERROR: %s", err.Error())
 	}
+
+	//1：根据nsqd结构获取对应的topic和channel，2：将topic和channel持久化到文件中，接下来调用启动nsqd的主逻辑nsqd.Main()，
+	// 主要完成这些过程:根据options参数监听tcp,http,https端口;启动4个goroutines分别实启动http api, queueScanLoop,lookupLoop,statsdLoop
+
 	err = nsqd.PersistMetadata()
 	if err != nil {
 		log.Fatalf("ERROR: failed to persist metadata - %s", err.Error())
