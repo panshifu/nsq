@@ -1,76 +1,193 @@
 package main
 
 import (
-	"crypto/tls"
-	"flag"
-	"fmt"
-	"log"
-	"math/rand"
 	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
-	"syscall"
+	"sync"
+	"sync/Mutex"
+	"sync/atomic"
 	"time"
-
-	"github.com/BurntSushi/toml"
-	"github.com/judwhite/go-svc/svc"
-	"github.com/mreiferson/go-options"
-	"github.com/nsqio/nsq/internal/app"
-	"github.com/nsqio/nsq/internal/version"
-	"github.com/nsqio/nsq/nsqd"
+	"crypto/md5"
+	"log"
 )
 
-type tlsRequiredOption int
-
-func (t *tlsRequiredOption) Set(s string) error {
-	s = strings.ToLower(s)
-	if s == "tcp-https" {
-		*t = nsqd.TLSRequiredExceptHTTP
-		return nil
-	}
-	required, err := strconv.ParseBool(s)
-	if required {
-		*t = nsqd.TLSRequired
-	} else {
-		*t = nsqd.TLSNotRequired
-	}
-	return err
+type Dirlock struct {
+	dir	string
+	f *os.File
 }
 
-func (t *tlsRequiredOption) Get() interface{} { return int(*t) }
-
-func (t *tlsRequiredOption) String() string {
-	return strconv.FormatInt(int64(*t), 10)
+type context struct {
+	nsqd *NSQD
 }
 
-func (t *tlsRequiredOption) IsBoolFlag() bool { return true }
+type Message struct {
+	ID MessageID
+	Body	[]byte
+	TimeStamp int64
+	Attempts	uint16
 
-type tlsMinVersionOption uint16
+	deliveryTS	time.Time
+	clientID 	int64
+	pri	int64
+	index	int
+	deferred	time.Duration
+}
 
-func (t *tlsMinVersionOption) Set(s string) error {
-	s = strings.ToLower(s)
-	switch s {
-	case "":
-		return nil
-	case "ssl3.0":
-		*t = tls.VersionSSL30
-	case "tls1.0":
-		*t = tls.VersionTLS10
-	case "tls1.1":
-		*t = tls.VersionTLS11
-	case "tls1.2":
-		*t = tls.VersionTLS12
-	default:
-		return fmt.Errorf("unknown tlsVersionOption %q", s)
+type Quantile struct {
+	sync.Mutex
+	streams [2]quantile.Stream
+	currentIndex	uint8
+	lastMoveWindow	time.Time
+	currentStream	*quantile.Stream
+
+}
+
+type BackendQueue interface {
+	Put([]byte) error
+	ReadChan() chan []byte
+	Close() error
+	Delete() error
+	Depth() error
+	Empty() error
+}
+
+type Consumer interface {
+	Unpause()
+	Pause()
+	Close() error
+	TimeOutMessage()
+	Stats() ClientStats
+	Empty()
+}
+
+type Channel struct {
+	requeueCount unint64
+	messageCount unint64
+	timeoutCount unint64
+
+	sync.RWMutex
+
+	topicName string
+	name string
+	ctx	*context
+
+	backend BackendQueue
+
+	memoryMsgChan	chan *Message
+	exitFlag	int32
+	exitMutex	sync.RWMutex
+
+	clients 	map[int64]Consumer
+	paused	int32
+	ephemeral	bool
+	deleteCallback	func(*Channel)
+	deleter	sync.Once
+
+	e2eProcessingLatencyStream *quantile.Quantile
+
+	deferredMessages map[MessageID]*pqueue.Item
+	deferredPQ	pqueue.PriorityQueue
+	deferredMutex	sync.Mutex
+	inFlightMessages	map[MessageID]*Message
+	inFlightPQ	inFlightPqueue
+	inFlightMutex	sync.Mutex
+}
+
+type Topic struct {
+	messageCount	unint64
+
+	sync.RWMutex
+
+	name	string
+	channelMap	map[string]*Channel
+	backend		BackendQueue
+	memoryMsgChan	chan *Message
+	startChan	chan int
+	exitChan	chan int
+	channelUpdateChan	chan int
+	waitGroup	util.WaitGroupWrapper
+	exitFlag	int32
+	idFactory	*guidFactory
+
+	ephemeral	bool
+	deleteCallback	func(*Topic)
+	deleter	sync.Once
+
+	pause 	int32
+	pauseChan	chan int
+	ctx *context
+
+}
+
+type NSQD struct {
+	clientIDSequence int64
+
+	sync.RWMutex
+
+	opts atomic.Value
+
+	dl	*Dirlock
+	isloading	int32
+	errValue	atomic.Value
+	startTime	time.Time
+
+	topicMap map[string]*Topic
+
+	clientLock sync.RWMutex
+	clients 	mao[int64]Client
+
+	lookupPeers	atomic.Value
+
+	tcpListener	net.Listener
+	httpListener	net.Listener
+	httpsListener	net.Listener
+	tlsConfig	*tls.Config
+
+	poolSize	int
+
+	notifyChan	chan interface{}
+	optsNotificationChan	chan struct{}
+	exitChan	chan int
+	waitGroup 	util.WaitGroupWrapper
+
+	ci *clusterinfo.ClusterInfo
+}
+
+type program struct {
+	nsqd *nsqd.NSQD
+}
+
+func NewOptions() *Options {
+	// 创建options结构，作为nsqd启动的参数来源
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Fatal(err)
 	}
-	return nil
-}
 
-func (t *tlsMinVersionOption) Get() interface{} { return uint16(*t) }
+	h := md5.New()
+	io.WriteString(h, hostname)
+	defauldID := int64(crc32.ChecksumIEEE(h.Sum(nil)) % 1024)
 
-func (t *tlsMinVersionOption) String() string {
-	return strconv.FormatInt(int64(*t), 10)
+	return &Options{
+		ID:	defauldID
+		LogPrefix:	"[nsqd]"
+		LogLevel:	"info"
+
+		TCPAddress:       "0.0.0.0:4150",
+		HTTPAddress:      "0.0.0.0:4151",
+		HTTPSAddress:     "0.0.0.0:4152",
+		BroadcastAddress: hostname,
+
+		MemQueueSize:	10000,
+		MaxBytesPerFile:	100 * 1024 * 1024,
+		SyncEvery:	2500,
+		SyncTimeout: 2 * time.Second,
+
+		QueueScanInterval:	100 * time.Millisecond,
+		QueueScanRefreshInterval:	5 * time.Second,
+		QueueScanSelectionCount:	20,
+		QueueScanWorkerPoolMax: 4,
+		QueueScanDirtyPercent:	0.25,
+	}
 }
 
 func nsqdFlagSet(opts *nsqd.Options) *flag.FlagSet {
@@ -148,62 +265,12 @@ func nsqdFlagSet(opts *nsqd.Options) *flag.FlagSet {
 	return flagSet
 }
 
-type config map[string]interface{}
-
-// Validate settings in the config file, and fatal on errors
-func (cfg config) Validate() {
-	// special validation/translation
-	if v, exists := cfg["tls_required"]; exists {
-		var t tlsRequiredOption
-		err := t.Set(fmt.Sprintf("%v", v))
-		if err == nil {
-			cfg["tls_required"] = t.String()
-		} else {
-			log.Fatalf("ERROR: failed parsing tls required %v", v)
-		}
-	}
-	if v, exists := cfg["tls_min_version"]; exists {
-		var t tlsMinVersionOption
-		err := t.Set(fmt.Sprintf("%v", v))
-		if err == nil {
-			newVal := fmt.Sprintf("%v", t.Get())
-			if newVal != "0" {
-				cfg["tls_min_version"] = newVal
-			} else {
-				delete(cfg, "tls_min_version")
-			}
-		} else {
-			log.Fatalf("ERROR: failed parsing tls min version %v", v)
-		}
-	}
-}
-
-type program struct {
-	nsqd *nsqd.NSQD
-}
-
-func main() {
-	prg := &program{}
-	// SIGINT(任意键),SIGTERM(kill)
-	if err := svc.Run(prg, syscall.SIGINT, syscall.SIGTERM); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func (p *program) Init(env svc.Environment) error {
-	if env.IsWindowsService() {
-		dir := filepath.Dir(os.Args[0])
-		return os.Chdir(dir)
-	}
-	return nil
-}
-
 func (p *program) Start() error {
-	//项目主入口
-	opts := nsqd.NewOptions() //生成nsqd启动参数
+	// 获取
+	opts := nsqd.NewOptions(opts)
 
-	flagSet := nsqdFlagSet(opts) //初始化生成一个flag,flag的作用
-	flagSet.Parse(os.Args[1:])	//
+	flagSet := nsqdFlagSet(opts)
+	flagSet.Parse(os.Args[1:])
 
 	rand.Seed(time.Now().UTC().UnixNano())
 
@@ -215,41 +282,28 @@ func (p *program) Start() error {
 	var cfg config
 	configFile := flagSet.Lookup("config").Value.String()
 	if configFile != "" {
-		_, err := toml.DecodeFile(configFile, &cfg)
+		_, err := toml.DecodeFi;e(configFile, &cfg)
 		if err != nil {
 			log.Fatalf("ERROR: failed to load config file %s - %s", configFile, err.Error())
 		}
 	}
-	cfg.Validate() //检测config文件的有效性
+	cfg.Validate()
 
-	// 通过flag包实现了命令行参数接收，如果命令行中执行配置文件，会同时读取配置文件。
-	// 根据配置文件，命令行参数，来创建一个nsqd
 	options.Resolve(opts, flagSet, cfg)
 	nsqd := nsqd.New(opts)
 
-	//LoadMetadata()过程；1：先使用atomic库加锁，2：读取node id的文件，以及默认文件，比对二者，并从文件中获取数据
-	//3:将数据json解析出meta结构，4：遍历meta，获取topic name以及channel name，对需要暂停的topic/channel进行暂停操作
 	err := nsqd.LoadMetadata()
 	if err != nil {
 		log.Fatalf("ERROR: %s", err.Error())
 	}
 
-	//1：根据nsqd结构获取对应的topic和channel，2：将topic和channel持久化到文件中，接下来调用启动nsqd的主逻辑nsqd.Main()，
-	// 主要完成这些过程:根据options参数监听tcp,http,https端口;启动4个goroutines分别实启动http api, queueScanLoop,lookupLoop,statsdLoop
-
-	err = nsqd.PersistMetadata() //保存Topic和channel信息
+	err = nsqd.PersistMetadata()
 	if err != nil {
-		log.Fatalf("ERROR: failed to persist metadata - %s", err.Error())
+		log.Fatalf("ERROR: fail to persist metadata - %s", err.Error())
 	}
 	nsqd.Main()
 
 	p.nsqd = nsqd
 	return nil
-}
 
-func (p *program) Stop() error {
-	if p.nsqd != nil {
-		p.nsqd.Exit()
-	}
-	return nil
 }

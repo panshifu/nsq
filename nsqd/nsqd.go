@@ -253,6 +253,7 @@ func (n *NSQD) Main() {
 		n.logf(LOG_FATAL, "listen (%s) failed - %s", n.getOpts().HTTPAddress, err)
 		os.Exit(1)
 	}
+	// 存在tls配置和含有https参数时，开启https服务
 	if n.tlsConfig != nil && n.getOpts().HTTPSAddress != "" {
 		n.httpsListener, err = tls.Listen("tcp", n.getOpts().HTTPSAddress, n.tlsConfig)
 		if err != nil {
@@ -260,7 +261,7 @@ func (n *NSQD) Main() {
 			os.Exit(1)
 		}
 	}
-
+	// 启动tcp，http，https三个server
 	tcpServer := &tcpServer{ctx: ctx}
 	n.waitGroup.Wrap(func() {
 		protocol.TCPServer(n.tcpListener, tcpServer, n.logf)
@@ -374,6 +375,7 @@ func (n *NSQD) PersistMetadata() error {
 
 	js := make(map[string]interface{})
 	topics := []interface{}{}
+	// 遍历nsqd中所有的topic
 	for _, topic := range n.topicMap {
 		if topic.ephemeral {
 			continue
